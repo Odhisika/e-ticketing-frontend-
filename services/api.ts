@@ -1,7 +1,10 @@
-import axios from 'axios';
+// src/services/api.ts
+import axios, { AxiosError } from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// Change this to your Django backend URL
+// ==============================
+// CONFIG
+// ==============================
 const BASE_URL = 'http://192.168.1.223:8000/api';
 
 const api = axios.create({
@@ -12,60 +15,149 @@ const api = axios.create({
   },
 });
 
-// Request interceptor to add auth token
+// ==============================
+// ERROR HANDLING UTILITIES
+// ==============================
+const getNetworkErrorMessage = (error: AxiosError): string => {
+  // Check if it's a network error (no response received)
+  if (!error.response) {
+    // Different types of connection issues
+    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+      return 'Request timed out. Please check your connection and try again.';
+    }
+    
+    if (error.code === 'ENOTFOUND' || error.message.includes('ENOTFOUND')) {
+      return 'Unable to connect to server. Please check your internet connection.';
+    }
+    
+    if (error.code === 'ECONNREFUSED' || error.message.includes('ECONNREFUSED')) {
+      return 'Server is currently unavailable. Please try again later.';
+    }
+    
+    if (error.message.includes('Network Error')) {
+      return 'Connection failed. Please check your internet connection and try again.';
+    }
+    
+    return 'Unable to connect to the server. Please try again.';
+  }
+  
+  // Handle HTTP status codes with user-friendly messages
+  const status = error.response.status;
+  switch (status) {
+    case 400:
+      return 'Invalid request. Please check your information and try again.';
+    case 401:
+      return 'Your session has expired. Please log in again.';
+    case 403:
+      return 'You don\'t have permission to perform this action.';
+    case 404:
+      return 'The requested resource was not found.';
+    case 408:
+      return 'Request timed out. Please try again.';
+    case 409:
+      return 'There was a conflict with your request. Please try again.';
+    case 422:
+      return 'Please check your input and try again.';
+    case 429:
+      return 'Too many requests. Please wait a moment and try again.';
+    case 500:
+      return 'Server error occurred. Please try again later.';
+    case 502:
+      return 'Service temporarily unavailable. Please try again.';
+    case 503:
+      return 'Service is currently under maintenance. Please try again later.';
+    case 504:
+      return 'Request timed out. Please try again.';
+    default:
+      if (status >= 500) {
+        return 'Server error occurred. Please try again later.';
+      } else if (status >= 400) {
+        return 'Something went wrong with your request. Please try again.';
+      }
+      return 'An unexpected error occurred. Please try again.';
+  }
+};
+
+const extractErrorMessage = (error: AxiosError): string => {
+  // First check if there's a server response with error details
+  if (error.response?.data) {
+    const data = error.response.data as any;
+    
+    // Common API error message fields
+    if (data.detail) return data.detail;
+    if (data.error) return data.error;
+    if (data.message) return data.message;
+    
+    // Handle validation errors (usually arrays or objects)
+    if (data.non_field_errors && Array.isArray(data.non_field_errors)) {
+      return data.non_field_errors[0];
+    }
+    
+    // Handle field-specific errors
+    if (typeof data === 'object') {
+      const firstErrorField = Object.keys(data)[0];
+      if (firstErrorField && Array.isArray(data[firstErrorField])) {
+        return `${firstErrorField}: ${data[firstErrorField][0]}`;
+      }
+      if (firstErrorField && typeof data[firstErrorField] === 'string') {
+        return data[firstErrorField];
+      }
+    }
+  }
+  
+  // Fall back to network error handling
+  return getNetworkErrorMessage(error);
+};
+
+// ==============================
+// ENHANCED SAFE HANDLER
+// ==============================
+type ApiResponse<T> = {
+  data?: T;
+  error?: string;
+  status?: number;
+};
+
+async function safeRequest<T>(promise: Promise<any>): Promise<ApiResponse<T>> {
+  try {
+    const res = await promise;
+    return { data: res.data, status: res.status };
+  } catch (err) {
+    const error = err as AxiosError<any>;
+    return {
+      error: extractErrorMessage(error),
+      status: error.response?.status,
+    };
+  }
+}
+
+// ==============================
+// INTERCEPTORS
+// ==============================
+
+// Attach token to every request
 api.interceptors.request.use(
   async (config) => {
     const token = await AsyncStorage.getItem('access_token');
-    console.log('Token from AsyncStorage:', token); // Debug log
-    
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
-      console.log('Authorization header set:', config.headers.Authorization); // Debug log
-    } else {
-      console.log('No token found in AsyncStorage'); // Debug log
     }
-    
-    console.log('Request config:', {
-      url: config.url,
-      method: config.method,
-      headers: config.headers,
-      data: config.data
-    }); // Debug log
-    
     return config;
   },
-  (error) => {
-    console.log('Request interceptor error:', error);
-    return Promise.reject(error);
-  }
+  (error) => Promise.reject(error)
 );
 
-// Response interceptor to handle token refresh
+// Handle token refresh with better error handling
 api.interceptors.response.use(
-  (response) => {
-    console.log('Response received:', {
-      status: response.status,
-      data: response.data
-    }); // Debug log
-    return response;
-  },
+  (response) => response,
   async (error) => {
-    console.log('Response error:', {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
-    }); // Debug log
-    
     const originalRequest = error.config;
 
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
-      console.log('Attempting token refresh...');
 
       try {
         const refreshToken = await AsyncStorage.getItem('refresh_token');
-        console.log('Refresh token:', refreshToken);
-        
         if (refreshToken) {
           const response = await axios.post(`${BASE_URL}/auth/token/refresh/`, {
             refresh: refreshToken,
@@ -73,16 +165,17 @@ api.interceptors.response.use(
 
           const { access } = response.data;
           await AsyncStorage.setItem('access_token', access);
-          console.log('Token refreshed successfully');
 
           originalRequest.headers.Authorization = `Bearer ${access}`;
           return api(originalRequest);
         }
       } catch (refreshError) {
-        console.log('Token refresh failed:', refreshError);
-        // Refresh failed, redirect to login
+        // Clear all tokens if refresh fails
         await AsyncStorage.multiRemove(['access_token', 'refresh_token', 'user']);
-        // You might want to emit an event here to redirect to login
+        
+        // Create a new error with user-friendly message
+        const newError = new Error('Your session has expired. Please log in again.');
+        return Promise.reject(newError);
       }
     }
 
@@ -90,6 +183,9 @@ api.interceptors.response.use(
   }
 );
 
+// ==============================
+// INTERFACES (unchanged)
+// ==============================
 export interface LoginRequest {
   email: string;
   password: string;
@@ -125,25 +221,10 @@ export interface Event {
   organizer: string;
 }
 
-export interface Order {
-  id: string;
-  order_id: string;
-  event: Event;
-  quantity: number;
-  total_amount: string;
-  payment_method: string;
-  status: 'pending' | 'approved' | 'rejected';
-  created_at: string;
-  updated_at: string;
-  tickets: Ticket[];
-  payment_confirmation?: PaymentConfirmation;
-}
-
-
 export interface Ticket {
   id: string;
   ticket_id: string;
-  qr_code?: string;  // URL to PNG image
+  qr_code?: string;
   is_used: boolean;
   created_at: string;
   order: {
@@ -174,7 +255,6 @@ export interface PaymentMethod {
   };
 }
 
-
 export interface PaymentConfirmation {
   id: string;
   order: Order;
@@ -185,24 +265,34 @@ export interface PaymentConfirmation {
   updated_at: string;
 }
 
-// Auth API
+export interface Order {
+  id: string;
+  order_id: string;
+  event: Event;
+  quantity: number;
+  total_amount: string;
+  payment_method: string;
+  status: 'pending' | 'approved' | 'rejected';
+  created_at: string;
+  updated_at: string;
+  tickets: Ticket[];
+  payment_confirmation?: PaymentConfirmation;
+}
+
+// ==============================
+// ENHANCED API METHODS
+// ==============================
 export const authAPI = {
-  login: async (data: LoginRequest): Promise<AuthResponse> => {
+  login: async (data: LoginRequest): Promise<ApiResponse<AuthResponse>> => {
     try {
-      console.log('Login request:', data);
       const res = await api.post('/auth/login/', data);
-      console.log('Login response:', res.data);
-      
       const { access, refresh, user } = res.data;
 
-      // Store tokens
       await AsyncStorage.setItem('access_token', access);
       await AsyncStorage.setItem('refresh_token', refresh);
       await AsyncStorage.setItem('user', JSON.stringify(user));
-      
-      console.log('Tokens stored successfully');
 
-      return {
+      const authResponse: AuthResponse = {
         access,
         refresh,
         user: {
@@ -213,26 +303,23 @@ export const authAPI = {
           is_admin: user.is_admin,
         },
       };
+
+      return { data: authResponse, status: res.status };
     } catch (error) {
-      console.log('Login error:', error);
-      throw error;
+      return { error: extractErrorMessage(error as AxiosError) };
     }
   },
 
-  register: async (data: RegisterRequest): Promise<AuthResponse> => {
+  register: async (data: RegisterRequest): Promise<ApiResponse<AuthResponse>> => {
     try {
-      console.log('Register request:', data);
       const res = await api.post('/auth/register/', data);
-      console.log('Register response:', res.data);
-      
       const { access, refresh, user } = res.data;
 
-      // Store tokens
       await AsyncStorage.setItem('access_token', access);
       await AsyncStorage.setItem('refresh_token', refresh);
       await AsyncStorage.setItem('user', JSON.stringify(user));
 
-      return {
+      const authResponse: AuthResponse = {
         access,
         refresh,
         user: {
@@ -243,102 +330,121 @@ export const authAPI = {
           is_admin: user.is_admin,
         },
       };
+
+      return { data: authResponse, status: res.status };
     } catch (error) {
-      console.log('Register error:', error);
-      throw error;
+      return { error: extractErrorMessage(error as AxiosError) };
     }
   },
 
-  refreshToken: async (refresh: string): Promise<{ access: string }> => {
-    const res = await api.post('/auth/token/refresh/', { refresh });
-    return res.data;
+  refreshToken: async (refresh: string): Promise<ApiResponse<{ access: string }>> => {
+    return safeRequest(api.post('/auth/token/refresh/', { refresh }));
   },
 };
 
-// Events API
+// ==============================
+// EVENTS API
+// ==============================
 export const eventsAPI = {
-  getEvents: () => api.get<Event[]>('/events/'),
-  getEvent: (id: string) => api.get<Event>(`/events/${id}/`),
+  getEvents: (): Promise<ApiResponse<Event[]>> => safeRequest(api.get('/events/')),
+  getEvent: (id: string): Promise<ApiResponse<Event>> => safeRequest(api.get(`/events/${id}/`)),
 };
 
-// src/services/api.ts
+// ==============================
+// ORDERS API
+// ==============================
 export const ordersAPI = {
-  debugAuth: () => api.get('/orders/debug-auth/'),
   createOrder: async (data: {
     event_id: string;
     quantity: number;
     payment_method: string;
-  }) => {
-    console.log('Creating order with data:', data);
-    const token = await AsyncStorage.getItem('access_token');
-    const user = await AsyncStorage.getItem('user');
-    console.log('Token available:', !!token);
-    console.log('User data:', user);
-    if (!token) {
-      throw new Error('No authentication token found. Please log in again.');
-    }
-    try {
-      console.log('Testing debug order data endpoint...');
-      const debugResponse = await api.post('/orders/debug-order-data/', data);
-      console.log('Debug order data response:', debugResponse.data);
-    } catch (debugError: any) {
-      console.log('Debug order data error:', debugError.response?.data);
-    }
-    return api.post<Order>('/orders/', data);
+  }): Promise<ApiResponse<Order>> => {
+    return safeRequest(api.post('/orders/', data));
   },
-  getOrders: () => api.get<Order[]>('/orders/list/'), 
-  getOrder: (id: string) => api.get<Order>(`/orders/${id}/`),
-  updateOrderStatus: (id: string, status: string) =>
-    api.patch<Order>(`/orders/${id}/`, { status }),
+  
+  getOrders: (): Promise<ApiResponse<Order[]>> => safeRequest(api.get('/orders/list/')),
+  
+  getOrder: (id: string): Promise<ApiResponse<Order>> => safeRequest(api.get(`/orders/${id}/`)),
+  
+  updateOrderStatus: (id: string, status: string): Promise<ApiResponse<Order>> =>
+    safeRequest(api.patch(`/orders/${id}/`, { status })),
 };
 
-// Admin API
+// ==============================
+// ADMIN API
+// ==============================
 export const adminAPI = {
-  getPendingOrders: () => api.get<Order[]>('/admin/orders/?status=pending'),
-  approveOrder: (orderId: string) =>
-    api.post(`/admin/orders/${orderId}/approve/`),
-  rejectOrder: (orderId: string) =>
-    api.post(`/admin/orders/${orderId}/reject/`),
+  getPendingOrders: (): Promise<ApiResponse<Order[]>> => 
+    safeRequest(api.get('/admin/orders/?status=pending')),
+    
+  approveOrder: (orderId: string): Promise<ApiResponse<any>> =>
+    safeRequest(api.post(`/admin/orders/${orderId}/approve/`)),
+    
+  rejectOrder: (orderId: string): Promise<ApiResponse<any>> =>
+    safeRequest(api.post(`/admin/orders/${orderId}/reject/`)),
 };
 
-// Tickets API
+// ==============================
+// TICKETS API
+// ==============================
 export const ticketsAPI = {
-  // Get all tickets
-  getTickets: () => api.get<Ticket[]>('/tickets/'),
-
-  // Get ticket detail by ID
-  getTicket: (ticketId: string) =>
-    api.get<Ticket>(`/tickets/${ticketId}/`),
-
-  // Validate ticket by ID
-  validateTicket: (ticketId: string) =>
-    api.post('/tickets/validate/', { ticket_id: ticketId }),
+  getTickets: (): Promise<ApiResponse<Ticket[]>> => safeRequest(api.get('/tickets/')),
+  
+  getTicket: (ticketId: string): Promise<ApiResponse<Ticket>> => 
+    safeRequest(api.get(`/tickets/${ticketId}/`)),
+    
+  validateTicket: (ticketId: string): Promise<ApiResponse<any>> =>
+    safeRequest(api.post('/tickets/validate/', { ticket_id: ticketId })),
 };
 
+// ==============================
+// PAYMENTS API
+// ==============================
 export const paymentAPI = {
-  getPaymentMethods: () => api.get<PaymentMethod[]>('/payment-methods/'),
-  submitPaymentConfirmation: (orderId: string, transactionId: string, screenshot: any) => {
-    const formData = new FormData();
-    formData.append('transaction_id', transactionId);
-    if (screenshot) {
-      formData.append('payment_screenshot', {
-        uri: screenshot.uri,
-        type: screenshot.type || 'image/jpeg',
-        name: screenshot.fileName || `screenshot_${Date.now()}.jpg`,
-      });
+  getPaymentMethods: (): Promise<ApiResponse<PaymentMethod[]>> => 
+    safeRequest(api.get('/payment-methods/')),
+
+  submitPaymentConfirmation: async (
+    orderId: string,
+    transactionId: string,
+    screenshot: any
+  ): Promise<ApiResponse<any>> => {
+    try {
+      const token = await AsyncStorage.getItem('access_token');
+      if (!token) {
+        return { error: 'Authentication required. Please log in again.' };
+      }
+
+      const formData = new FormData();
+      formData.append('transaction_id', transactionId);
+
+      if (screenshot) {
+        const fileData = {
+          uri: screenshot.uri,
+          type: screenshot.type || 'image/jpeg',
+          name: screenshot.fileName || `screenshot_${Date.now()}.jpg`,
+        };
+        formData.append('payment_screenshot', fileData as any);
+      }
+
+      const response = await axios.post(
+        `${BASE_URL}/payments/${orderId}/submit-confirmation/`,
+        formData,
+        {
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'multipart/form-data',
+          },
+          timeout: 60000,
+        }
+      );
+
+      return { data: response.data, status: response.status };
+    } catch (error) {
+      return { error: extractErrorMessage(error as AxiosError) };
     }
-    return api.post<PaymentConfirmation>(`/payments/${orderId}/submit-confirmation/`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
   },
 };
-
 
 export default api;
-
-
-
-
-
-
-

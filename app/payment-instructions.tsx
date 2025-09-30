@@ -89,37 +89,105 @@ export default function PaymentInstructionsScreen() {
   const pickImage = async () => {
     const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permissionResult.granted) {
-      Alert.alert('Permission Denied', 'Please allow access to your photo library.');
+      Alert.alert("Permission Denied", "Please allow access to your photo library.");
       return;
     }
-
+  
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ImagePicker.MediaTypeOptions.Images, // Use MediaTypeOptions as per expo-image-picker API
       allowsEditing: true,
       quality: 0.8,
+      aspect: [4, 3], // Optional: set aspect ratio
     });
-
+  
     if (!result.canceled) {
-      setScreenshot(result.assets[0]);
+      const asset = result.assets[0];
+      
+      // Create proper file object for React Native FormData
+      setScreenshot({
+        uri: asset.uri,
+        type: asset.mimeType || "image/jpeg", // Use mimeType instead of type
+        fileName: asset.fileName || `screenshot_${Date.now()}.jpg`,
+      });
+      
+      console.log("Image selected:", {
+        uri: asset.uri,
+        type: asset.mimeType,
+        fileName: asset.fileName,
+        width: asset.width,
+        height: asset.height,
+        fileSize: asset.fileSize
+      });
     }
   };
+  
 
   const handleSubmitProof = async () => {
     if (!transactionId.trim()) {
-      Alert.alert('Error', 'Please enter a transaction ID.');
+      Alert.alert("Error", "Please enter a transaction ID.");
       return;
     }
-
+  
+    if (!screenshot) {
+      Alert.alert("Error", "Please upload a payment screenshot.");
+      return;
+    }
+  
     setSubmitting(true);
     setSubmissionMessage(null);
+  
     try {
-      await paymentAPI.submitPaymentConfirmation(orderId as string, transactionId, screenshot);
-      setPaymentStatus('paid');
-      setSubmissionMessage('Payment proof submitted successfully! Awaiting admin approval.');
-      setTransactionId('');
+      console.log("Starting payment proof submission...");
+      
+      await paymentAPI.submitPaymentConfirmation(
+        orderId as string,
+        transactionId,
+        screenshot
+      );
+  
+      console.log("Payment proof submitted successfully!");
+      
+      setPaymentStatus("paid");
+      setSubmissionMessage(
+        "Payment proof submitted successfully! Awaiting admin approval."
+      );
+      
+      // Clear form only on success
+      setTransactionId("");
       setScreenshot(null);
+      
+      // Show success alert
+      Alert.alert(
+        "Success", 
+        "Your payment proof has been submitted successfully. You will receive a confirmation once approved.",
+        [{ text: "OK" }]
+      );
+  
     } catch (error: any) {
-      setSubmissionMessage(error.response?.data?.error || 'Failed to submit payment proof.');
+      console.error("Payment submission failed:", error);
+      
+      // More user-friendly error handling
+      let errorMessage = "Failed to submit payment proof. Please try again.";
+      
+      if (error.message.includes('Network Error')) {
+        errorMessage = "Network error. Please check your internet connection and try again.";
+      } else if (error.message.includes('401')) {
+        errorMessage = "Authentication error. Please log in again.";
+      } else if (error.message.includes('400')) {
+        errorMessage = "Invalid data. Please check your transaction ID and screenshot.";
+      } else if (error.message.includes('timeout')) {
+        errorMessage = "Request timeout. Please try again with a smaller image.";
+      } else if (error.message) {
+        errorMessage = error.message;
+      }
+      
+      setSubmissionMessage(errorMessage);
+      
+      // Show error alert
+      Alert.alert("Error", errorMessage);
+      
+      // Don't clear the form on error so user can retry
+      
     } finally {
       setSubmitting(false);
     }
